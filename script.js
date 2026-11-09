@@ -97,12 +97,22 @@ function migrate(d){
   return d;
 }
 function newData(ip){const d={n:ip.n,cod:ip.cod,peca:{data:ip.ini,cliente:ip.cli,codigo:ip.cod,descricao:ip.desc,liga:ip.liga},"macho.on":"Não","rastreio.on":"Não","luva.on":"Não","af.on":"Não","fur.on":"Não","bloco.on":"Não","hdr.rev":"0","hdr.revObs":""};return migrate(d);}
+const CFG_CACHE_KEY="prometals:cfgCache";
+function loadCachedConfig(){try{const raw=localStorage.getItem(CFG_CACHE_KEY);if(!raw)return;const c=JSON.parse(raw);if(Array.isArray(c.ips))customIps=c.ips;if(c.status&&typeof c.status==="object")statusOv=c.status;if(Array.isArray(c.del))delSeeds=c.del;applyStatusOv();}catch(e){}}
 async function loadConfig(){
   ipsCarregouOk=false;
   const r=await sGetRaw("cfg:ips");
-  if(r.ok){ try{customIps=r.value?JSON.parse(r.value):[];}catch(e){customIps=[];} ipsCarregouOk=true; }
-  else { customIps=[]; if(typeof toast==="function")toast("Sem conexão com a lista de peças — modo protegido"); }
-  const s=await sGet("cfg:status");statusOv=s?JSON.parse(s):{};const ds=await sGet("cfg:delSeeds");delSeeds=ds?JSON.parse(ds):[];applyStatusOv();
+  if(r.ok){
+    try{customIps=r.value?JSON.parse(r.value):[];}catch(e){customIps=[];}
+    ipsCarregouOk=true;
+    const s=await sGet("cfg:status");statusOv=s?JSON.parse(s):{};
+    const ds=await sGet("cfg:delSeeds");delSeeds=ds?JSON.parse(ds):[];
+    applyStatusOv();
+    try{localStorage.setItem(CFG_CACHE_KEY,JSON.stringify({ips:customIps,status:statusOv,del:delSeeds}));}catch(e){}
+  } else {
+    if(typeof toast==="function")toast("Sem conexão com a lista de peças — modo protegido");
+    applyStatusOv();
+  }
 }
 function podeGravarLista(){ if(!ipsCarregouOk){ if(typeof toast==="function")toast("Protegido: a lista não foi carregada — recarregue o app antes de cadastrar/alterar."); return false; } return true; }
 
@@ -1073,7 +1083,7 @@ function subscribeRealtime(){try{if(__rt)return;__rt=supa.channel("kv-sync").on(
 function onRemoteChange(payload){const key=(payload.new&&payload.new.key)||(payload.old&&payload.old.key)||"";if(!key)return;clearTimeout(__rtT);__rtT=setTimeout(async()=>{try{if(key==="cfg:opts")await loadOpts();if(key==="cfg:ips"||key==="cfg:status"||key==="cfg:delSeeds")await loadConfig();const dv=document.getElementById("detailView");const onForm=dv&&dv.style.display==="block";if(key==="cfg:status"&&onForm&&curIP)paintStatusSel(statusOv[curIP.n]||curIP.status);if(onForm&&curIP){if(key.startsWith("p:"+curIP.n+":")){await loadPhotos(curIP.n);await renderForm();}else if(key==="ip:"+curIP.n+":data")toast("Esta IP foi atualizada em outro aparelho");}else if(key.startsWith("p:")||key.startsWith("ip:")||key==="cfg:ips"||key==="cfg:status"){await loadCounts();renderList();}}catch(e){console.error("sync",e);}},350);}
 document.getElementById("searchInput").addEventListener("input",e=>{searchTerm=e.target.value;renderList();});
 (async function init(){
-  renderFilters();renderCatTabs();
+  renderFilters();loadCachedConfig();renderCatTabs();
   if(!initSupa()){showLogin("Erro ao carregar a conexão. Recarregue a página.");return;}
   ["loginEmail","loginPass"].forEach(id=>{const el=document.getElementById(id);if(el)el.addEventListener("keydown",e=>{if(e.key==="Enter")doLogin();});});
   const codeEl=document.getElementById("prodCodigo");if(codeEl)codeEl.addEventListener("keydown",e=>{if(e.key==="Enter")doProdLogin();});

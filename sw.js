@@ -1,7 +1,7 @@
 // Service worker - Instrução de Processo Prometals
 // Estratégia: rede primeiro (sempre pega a versão nova quando online),
 // com cache de reserva para funcionar offline / instalar como app.
-const CACHE = 'prometals-v11';
+const CACHE = 'prometals-v12';
 const CORE = [
   './',
   './index.html',
