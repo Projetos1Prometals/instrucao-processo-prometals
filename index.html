@@ -185,6 +185,11 @@
     <div id="optsList"></div>
     <div style="margin-top:10px;color:var(--dim);font-size:12px;line-height:1.4">Os itens marcados como <b>(padrão)</b> vêm da base inicial e não podem ser excluídos. Os que você adicionar ficam salvos e aparecem como sugestão nos campos do formulário.</div>
   </div>
+  <div class="fieldcard" style="margin-top:12px">
+    <div class="grp-h">Manutenção (admin)</div>
+    <button type="button" onclick="migrarFotosStorage()" style="width:100%;padding:12px;background:#191c20;border:1px solid var(--ember,#ff6a1a);color:var(--ember,#ff6a1a);border-radius:9px;font-weight:700;font-size:14px;cursor:pointer">☁️ Mover fotos para o Storage</button>
+    <div style="margin-top:8px;color:var(--dim);font-size:12px;line-height:1.4">Libera espaço no banco. Seguro: cada foto só sai do banco depois de confirmar que subiu no Storage. Pode rodar de novo se parar no meio. Requer o bucket <b>fotos</b> criado no Supabase.</div>
+  </div>
 </div>
 
 <script src="script.js"></script>

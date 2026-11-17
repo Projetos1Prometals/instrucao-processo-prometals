@@ -33,8 +33,42 @@ async function sSet(k,v){try{const {error}=await supa.from("kv").upsert({key:k,v
 async function sDel(k){try{const {error}=await supa.from("kv").delete().eq("key",k);if(error)throw error;}catch(e){console.error("sDel",k,e);}}
 async function sList(p){try{const out=[];const page=1000;let from=0;while(true){const {data,error}=await supa.from("kv").select("key").like("key",likeEsc(p)+"%").range(from,from+page-1);if(error)throw error;if(!data||!data.length)break;out.push(...data.map(r=>r.key));if(data.length<page)break;from+=page;}return out;}catch(e){console.error("sList",p,e);return [];}}
 async function sListKV(p){try{const {data,error}=await supa.from("kv").select("key,value").like("key",likeEsc(p)+"%");if(error)throw error;return data||[];}catch(e){console.error("sListKV",p,e);return [];}}
+/* ===== Fotos: binário no Supabase Storage, "etiqueta" leve no banco ===== */
+const ST_BUCKET="fotos";
+const STMARK="@storage";
+function stOn(){return typeof supa!=="undefined"&&supa&&supa.storage;}
+function stPath(key){const p=String(key).split(":");if(p[0]==="p")return p[1]+"/"+p[2]+".jpg";if(p[0]==="rp")return p[1]+"/rev_"+p[2]+"_"+p[3]+".jpg";return p.join("_")+".jpg";}
+function dataURLtoBlob(d){const parts=String(d).split(",");const mime=(parts[0].match(/:(.*?);/)||[])[1]||"image/jpeg";const bin=atob(parts[1]||"");const u=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)u[i]=bin.charCodeAt(i);return new Blob([u],{type:mime});}
+function blobToDataURL(b){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result);r.onerror=rej;r.readAsDataURL(b);});}
+async function stUpload(key,dataURL){const {error}=await supa.storage.from(ST_BUCKET).upload(stPath(key),dataURLtoBlob(dataURL),{upsert:true,contentType:"image/jpeg"});if(error)throw error;}
+async function stDownload(key){try{const {data,error}=await supa.storage.from(ST_BUCKET).download(stPath(key));if(error||!data)return null;return await blobToDataURL(data);}catch(e){return null;}}
+async function stRemove(key){try{await supa.storage.from(ST_BUCKET).remove([stPath(key)]);}catch(e){}}
+/* valor no banco: a própria imagem (data:) p/ foto não migrada, ou STMARK (foto no Storage) */
+function photoVal(key,v){if(!v)return Promise.resolve(null);if(String(v).indexOf("data:")===0)return Promise.resolve(v);if(stOn())return stDownload(key);return Promise.resolve(null);}
+async function photoGet(key){const v=await sGet(key);return await photoVal(key,v);}
+async function photoPut(key,dataURL){if(stOn()){try{await stUpload(key,dataURL);await sSet(key,STMARK);return;}catch(e){console.error("Storage upload falhou — salvando no banco",e);}}await sSet(key,dataURL);}
+async function photoDel(key){if(stOn())await stRemove(key);await sDel(key);}
+async function migrarFotosStorage(){
+  if(!stOn()){alert("Storage indisponível (verifique conexão/login).");return;}
+  if(!confirm("Mover TODAS as fotos para o Storage?\n\nÉ seguro: cada foto só sai do banco depois de confirmar que subiu. Pode levar alguns minutos e pode ser rodado de novo se parar no meio."))return;
+  let keys=[];try{keys=[...await sList("p:"),...await sList("rp:")];}catch(e){alert("Erro ao listar as fotos.");return;}
+  let ok=0,skip=0,err=0;
+  for(let i=0;i<keys.length;i++){
+    const k=keys[i];showLoader("Movendo fotos p/ Storage… "+(i+1)+"/"+keys.length+"  (ok:"+ok+"  erro:"+err+")");
+    try{
+      const v=await sGet(k);
+      if(!v){skip++;continue;}
+      if(String(v).indexOf("data:")!==0){skip++;continue;} // já é etiqueta = já migrada
+      await stUpload(k,v);          // sobe primeiro
+      await sSet(k,STMARK);         // só então troca pela etiqueta leve
+      ok++;
+    }catch(e){err++;console.error("migra",k,e);}
+  }
+  hideLoader();
+  alert("Migração concluída.\n\nMovidas agora: "+ok+"\nJá estavam no Storage: "+skip+"\nErros: "+err+(err?"\n\nRode de novo para tentar as que falharam.":"\n\nAgora, no SQL Editor do Supabase, rode:  VACUUM FULL kv;  para o banco encolher de verdade."));
+}
 
-let curIP=null,customIps=[],searchTerm="",D={},saveT=null,curSlot=null,pendingNew=false,statusOv={},metaDirty=false,delSeeds=[],curCat="terceiros";
+let curIP=null,customIps=[],searchTerm="",D={},saveT=null,curSlot=null,pendingNew=false,statusOv={},metaDirty=false,delSeeds=[],curCat="terceiros",__listReady=false,listScrollY=0;
 let imgCache={},revImgCache={};
 let ipsCarregouOk=false; // só grava a lista de peças se ela foi carregada com sucesso
 async function loadPhotoFlags(n){
@@ -42,11 +76,11 @@ async function loadPhotoFlags(n){
   window.__have=new Set(keys.map(k=>k.split(":")[2]));
 }
 async function fetchPhotoValues(n){
-  // Busca TODAS as fotos da peça em um pedido só (antes era uma por uma, em fila).
+  // Lê as etiquetas em um pedido só; as fotos no Storage são baixadas em paralelo.
   const rows=await sListKV(`p:${n}:`);
-  rows.forEach(r=>{const slot=r.key.split(":")[2];if(r.value)imgCache[slot]=r.value;});
+  await Promise.all(rows.map(async r=>{const slot=r.key.split(":")[2];const d=await photoVal(r.key,r.value);if(d)imgCache[slot]=d;}));
   const rrows=await sListKV(`rp:${n}:`);
-  rrows.forEach(r=>{const p=r.key.split(":");if(p.length>=4&&r.value)revImgCache[p[2]+":"+p[3]]=r.value;});
+  await Promise.all(rrows.map(async r=>{const p=r.key.split(":");if(p.length<4)return;const d=await photoVal(r.key,r.value);if(d)revImgCache[p[2]+":"+p[3]]=d;}));
 }
 function applyPhotoThumbs(){
   const fb=document.getElementById("formBody");if(!fb)return;
@@ -98,13 +132,13 @@ function migrate(d){
 }
 function newData(ip){const d={n:ip.n,cod:ip.cod,peca:{data:ip.ini,cliente:ip.cli,codigo:ip.cod,descricao:ip.desc,liga:ip.liga},"macho.on":"Não","rastreio.on":"Não","luva.on":"Não","af.on":"Não","fur.on":"Não","bloco.on":"Não","hdr.rev":"0","hdr.revObs":""};return migrate(d);}
 const CFG_CACHE_KEY="prometals:cfgCache";
-function loadCachedConfig(){try{const raw=localStorage.getItem(CFG_CACHE_KEY);if(!raw)return;const c=JSON.parse(raw);if(Array.isArray(c.ips))customIps=c.ips;if(c.status&&typeof c.status==="object")statusOv=c.status;if(Array.isArray(c.del))delSeeds=c.del;applyStatusOv();}catch(e){}}
+function loadCachedConfig(){try{const raw=localStorage.getItem(CFG_CACHE_KEY);if(!raw)return;const c=JSON.parse(raw);if(Array.isArray(c.ips))customIps=c.ips;if(c.status&&typeof c.status==="object")statusOv=c.status;if(Array.isArray(c.del))delSeeds=c.del;applyStatusOv();__listReady=true;}catch(e){}}
 async function loadConfig(){
   ipsCarregouOk=false;
   const r=await sGetRaw("cfg:ips");
   if(r.ok){
     try{customIps=r.value?JSON.parse(r.value):[];}catch(e){customIps=[];}
-    ipsCarregouOk=true;
+    ipsCarregouOk=true;__listReady=true;
     const s=await sGet("cfg:status");statusOv=s?JSON.parse(s):{};
     const ds=await sGet("cfg:delSeeds");delSeeds=ds?JSON.parse(ds):[];
     applyStatusOv();
@@ -150,7 +184,7 @@ function hideLoader(){document.getElementById("loader").classList.remove("on");}
 function compress(file){return new Promise((res,rej)=>{const reader=new FileReader();reader.onload=e=>{const img=new Image();img.onload=()=>{const c=document.createElement("canvas");let w=img.width,h=img.height,MAX=1280;if(w>MAX){h=Math.round(h*MAX/w);w=MAX;}c.width=w;c.height=h;const ctx=c.getContext("2d");ctx.drawImage(img,0,0,w,h);res(c.toDataURL("image/jpeg",0.75));};img.onerror=rej;img.src=e.target.result;};reader.onerror=rej;reader.readAsDataURL(file);});}
 
 function renderFilters(){const f=document.getElementById("filters");const tags=["Todos","Concluído","Processo","Incompleto","Validação"];f.innerHTML=tags.map(t=>`<div class="chip ${searchTerm===t?'on':''}" onclick="setFilter('${t}')">${t}</div>`).join("");}
-function renderCatTabs(){const el=document.getElementById("cattabs");if(!el)return;const all=allIps();const cnt=c=>all.filter(ip=>catOf(ip)===c).length;const tabs=[{k:"terceiros",t:"Terceiros"},{k:"interno",t:"Interno"}];el.innerHTML=tabs.map(tb=>`<div class="cattab ${curCat===tb.k?'on':''}" onclick="setCat('${tb.k}')">${tb.t} <span class="cnt">${cnt(tb.k)}</span></div>`).join("");}
+function renderCatTabs(){const el=document.getElementById("cattabs");if(!el)return;const all=allIps();const cnt=c=>all.filter(ip=>catOf(ip)===c).length;const tabs=[{k:"terceiros",t:"Terceiros"},{k:"interno",t:"Interno"}];el.innerHTML=tabs.map(tb=>`<div class="cattab ${curCat===tb.k?'on':''}" onclick="setCat('${tb.k}')">${tb.t} <span class="cnt">${__listReady?cnt(tb.k):""}</span></div>`).join("");}
 function setCat(c){curCat=c;searchTerm="";const si=document.getElementById("searchInput");if(si)si.value="";renderCatTabs();renderFilters();renderList();}
 function setFilter(t){searchTerm=(t==="Todos"?"":t);renderList();renderFilters();}
 
@@ -323,6 +357,7 @@ function syncMeta(k){const map={"peca.codigo":"cod","peca.descricao":"desc","pec
 /* ---- detail / form ---- */
 async function openIP(n){
   curIP=allIps().find(x=>x.n===n);if(!curIP)return;
+  listScrollY=window.scrollY||document.documentElement.scrollTop||0;
   const raw=await sGet(dkey(n));
   if(raw){try{D=migrate(JSON.parse(raw));}catch(e){D=newData(curIP);}}else{D=newData(curIP);await sSet(dkey(n),JSON.stringify(D));}
   imgCache={};revImgCache={};
@@ -432,14 +467,14 @@ function revFotosHtml(){
 }
 async function registrarRevisao(){
   if(!curIP)return;
-  const f=await sGet(pkey(curIP.n,"alt_frente"));
-  const t=await sGet(pkey(curIP.n,"alt_traseira"));
+  const f=await photoGet(pkey(curIP.n,"alt_frente"));
+  const t=await photoGet(pkey(curIP.n,"alt_traseira"));
   if(!f&&!t){toast("Adicione ao menos uma foto na Engenharia primeiro");return;}
   showLoader("Registrando revisão...");
   try{
     const id=Date.now().toString(36)+Math.floor(Math.random()*1000).toString(36);
-    if(f){await sSet(rpkey(curIP.n,id,"f"),f);revImgCache[id+":f"]=f;}
-    if(t){await sSet(rpkey(curIP.n,id,"t"),t);revImgCache[id+":t"]=t;}
+    if(f){await photoPut(rpkey(curIP.n,id,"f"),f);revImgCache[id+":f"]=f;}
+    if(t){await photoPut(rpkey(curIP.n,id,"t"),t);revImgCache[id+":t"]=t;}
     if(!Array.isArray(D.revFotos))D.revFotos=[];
     const num=D.revFotos.length+1;
     D.revFotos.push({id,num,data:nowBR(),hasF:!!f,hasT:!!t,obs:S(val("alt.obs")).slice(0,120)});
@@ -452,7 +487,7 @@ async function registrarRevisao(){
 }
 let curRev=null;
 async function openRevView(id,which,num){
-  const v=await sGet(rpkey(curIP.n,id,which));
+  const v=await photoGet(rpkey(curIP.n,id,which));
   if(!v){toast("Foto não encontrada");return;}
   curRev={id,which};
   document.getElementById("revViewLbl").textContent=`Revisão ${num} — ${which==="f"?"Foto 1":"Foto 2"}`;
@@ -460,13 +495,13 @@ async function openRevView(id,which,num){
   document.getElementById("revViewModal").classList.add("on");
 }
 function closeRevView(){document.getElementById("revViewModal").classList.remove("on");curRev=null;}
-async function dlRevPhoto(){if(!curRev)return;const v=await sGet(rpkey(curIP.n,curRev.id,curRev.which));if(!v)return;const a=document.createElement("a");a.href=v;a.download=`IP${curIP.n}_revisao_${curRev.which==="f"?"foto1":"foto2"}.jpg`;a.click();}
+async function dlRevPhoto(){if(!curRev)return;const v=await photoGet(rpkey(curIP.n,curRev.id,curRev.which));if(!v)return;const a=document.createElement("a");a.href=v;a.download=`IP${curIP.n}_revisao_${curRev.which==="f"?"foto1":"foto2"}.jpg`;a.click();}
 async function delRevFoto(i){
   if(!Array.isArray(D.revFotos)||!D.revFotos[i])return;
   if(!confirm("Excluir esta revisão e suas fotos?"))return;
   const r=D.revFotos[i];
-  await sDel(rpkey(curIP.n,r.id,"f"));
-  await sDel(rpkey(curIP.n,r.id,"t"));
+  await photoDel(rpkey(curIP.n,r.id,"f"));
+  await photoDel(rpkey(curIP.n,r.id,"t"));
   delete revImgCache[r.id+":f"];delete revImgCache[r.id+":t"];
   D.revFotos.splice(i,1);
   await saveData();
@@ -617,17 +652,17 @@ function closeSrc(){document.getElementById("srcModal").classList.remove("on");}
 function pickSrc(src){closeSrc();const inp=src==="cam"?fileInputCam:fileInput;inp.value="";inp.click();}
 fileInput.onchange=e=>{const f=e.target.files[0];if(f)saveIncomingPhoto(f);};
 fileInputCam.onchange=e=>{const f=e.target.files[0];if(f)saveIncomingPhoto(f);};
-async function saveIncomingPhoto(f){showLoader("Otimizando e salvando foto...");try{const data=await compress(f);await sSet(pkey(curIP.n,curSlot),data);imgCache[curSlot]=data;window.__have.add(curSlot);await sDel(`ed:${curIP.n}:${curSlot}:orig`);await sDel(`ed:${curIP.n}:${curSlot}:ops`);updateCurCount();await renderForm();hideLoader();if(EDITABLE_SLOTS.includes(curSlot)){openEdPhoto(curSlot);}else{toast("Foto salva ✓");}}catch(err){hideLoader();toast("Erro ao salvar");}}
-async function openModal(id){curSlot=id;const v=imgCache[id]||await sGet(pkey(curIP.n,id));document.getElementById("mLbl").textContent=LBL[id]||id;document.getElementById("mImg").innerHTML=`<img src="${v}">`;document.getElementById("mEdit").style.display=EDITABLE_SLOTS.includes(id)?"flex":"none";document.getElementById("modal").classList.add("on");}
+async function saveIncomingPhoto(f){showLoader("Otimizando e salvando foto...");try{const data=await compress(f);await photoPut(pkey(curIP.n,curSlot),data);imgCache[curSlot]=data;window.__have.add(curSlot);await sDel(`ed:${curIP.n}:${curSlot}:orig`);await sDel(`ed:${curIP.n}:${curSlot}:ops`);updateCurCount();await renderForm();hideLoader();if(EDITABLE_SLOTS.includes(curSlot)){openEdPhoto(curSlot);}else{toast("Foto salva ✓");}}catch(err){hideLoader();toast("Erro ao salvar");}}
+async function openModal(id){curSlot=id;const v=imgCache[id]||await photoGet(pkey(curIP.n,id));document.getElementById("mLbl").textContent=LBL[id]||id;document.getElementById("mImg").innerHTML=`<img src="${v}">`;document.getElementById("mEdit").style.display=EDITABLE_SLOTS.includes(id)?"flex":"none";document.getElementById("modal").classList.add("on");}
 function closeModal(){document.getElementById("modal").classList.remove("on");}
-async function deletePhoto(){if(!confirm("Excluir esta foto?"))return;await sDel(pkey(curIP.n,curSlot));delete imgCache[curSlot];window.__have.delete(curSlot);updateCurCount();closeModal();await renderForm();toast("Foto excluída");}
-async function downloadOne(){const v=await sGet(pkey(curIP.n,curSlot));const a=document.createElement("a");a.href=v;a.download=`IP${curIP.n}_${slug(LBL[curSlot])}.jpg`;a.click();}
+async function deletePhoto(){if(!confirm("Excluir esta foto?"))return;await photoDel(pkey(curIP.n,curSlot));delete imgCache[curSlot];window.__have.delete(curSlot);updateCurCount();closeModal();await renderForm();toast("Foto excluída");}
+async function downloadOne(){const v=await photoGet(pkey(curIP.n,curSlot));const a=document.createElement("a");a.href=v;a.download=`IP${curIP.n}_${slug(LBL[curSlot])}.jpg`;a.click();}
 
 /* ===== EDITOR DE FOTO (linhas + etiquetas) ===== */
 const EDITABLE_SLOTS=["luva_pos","cola","alt_frente","alt_traseira","furacao","bloco","pint_frente","pint_traseiro","pint_macho","corte_local","reb_resultado"];
 let epImg=null,epTool="linha",epOps=[],epCanvas=null,epCtx=null,epSlot=null,epDrawing=false,epCurStroke=null,epDragLabel=null,epDragOff=null,epDragLast=null,epBound=false,epActive=null,epResizing=null,epLW=1,epBaseData=null,epHadOrig=false;
 async function openEdPhoto(slot){
-  const v=await sGet(pkey(curIP.n,slot));if(!v){toast("Tire ou escolha a foto primeiro");return;}
+  const v=await photoGet(pkey(curIP.n,slot));if(!v){toast("Tire ou escolha a foto primeiro");return;}
   const orig=await sGet(`ed:${curIP.n}:${slot}:orig`);
   let ops=[];try{const r=await sGet(`ed:${curIP.n}:${slot}:ops`);if(r)ops=JSON.parse(r)||[];}catch(e){ops=[];}
   epHadOrig=!!orig;epBaseData=orig||v;
@@ -894,14 +929,14 @@ let epThickI=0;
 function epCycleThick(){epThickI=(epThickI+1)%EP_THICK.length;epLW=EP_THICK[epThickI].v;const b=document.getElementById("epThick");if(b)b.textContent="➖ Espessura: "+EP_THICK[epThickI].n;if(epActive&&(epActive.type==="stroke"||epActive.type==="linhav")){epActive.lw=epLW;epRedraw();}}
 function epUndo(){epOps.pop();epRedraw();}
 function epClear(){if(epOps.length&&!confirm("Apagar todas as marcações?"))return;epOps=[];epRedraw();}
-async function epSave(){showLoader("Salvando edição...");try{const data=epCanvas.toDataURL("image/jpeg",0.82);await sSet(pkey(curIP.n,epSlot),data);imgCache[epSlot]=data;window.__have.add(epSlot);if(!epHadOrig&&epBaseData)await sSet(`ed:${curIP.n}:${epSlot}:orig`,epBaseData);await sSet(`ed:${curIP.n}:${epSlot}:ops`,JSON.stringify(epOps));epHadOrig=true;updateCurCount();await renderForm();hideLoader();closeEdPhoto();toast("Foto editada salva ✓");}catch(e){hideLoader();toast("Erro ao salvar edição");}}
+async function epSave(){showLoader("Salvando edição...");try{const data=epCanvas.toDataURL("image/jpeg",0.82);await photoPut(pkey(curIP.n,epSlot),data);imgCache[epSlot]=data;window.__have.add(epSlot);if(!epHadOrig&&epBaseData)await sSet(`ed:${curIP.n}:${epSlot}:orig`,epBaseData);await sSet(`ed:${curIP.n}:${epSlot}:ops`,JSON.stringify(epOps));epHadOrig=true;updateCurCount();await renderForm();hideLoader();closeEdPhoto();toast("Foto editada salva ✓");}catch(e){hideLoader();toast("Erro ao salvar edição");}}
 
 async function downloadAll(){
   const keys=await sList(`p:${curIP.n}:`);
   showLoader("Montando o arquivo .zip...");
   try{
     const zip=new JSZip(),folder=zip.folder(`IP${curIP.n}_${slug(curIP.cod)}`);
-    let i=1;for(const k of keys){const slot=k.split(":")[2],v=await sGet(k);if(!v)continue;folder.file(`${String(i).padStart(2,"0")}_${slug(LBL[slot]||slot)}.jpg`,v.split(",")[1],{base64:true});i++;}
+    let i=1;for(const k of keys){const slot=k.split(":")[2],v=await photoGet(k);if(!v)continue;folder.file(`${String(i).padStart(2,"0")}_${slug(LBL[slot]||slot)}.jpg`,v.split(",")[1],{base64:true});i++;}
     let txt=`INSTRUÇÃO DE PROCESSO PROMETALS — IP ${curIP.n}\nCódigo: ${val("peca.codigo")}\nCliente: ${val("peca.cliente")}\nLiga: ${val("peca.liga")}\nDescrição: ${val("peca.descricao")}\nData: ${val("peca.data")}\n\n`;
     txt+=`PESO BRUTO: ${val("reb.bruto")} kg\nPESO REBARBADO: ${val("reb.rebarbado")} kg\n\nFURAÇÃO: broca ${val("fur.broca")}, ${val("fur.qtd")} furos\n\n`;
     txt+=`LUVA: ${val("luva.on")==="Não"?"não tem":(val("luva")||[]).map(r=>r.modelo+" x"+r.qtd).filter(x=>x.trim()!=="x").join(", ")}\nFILTRO: ${(val("filtro")||[]).map(r=>r.modelo+" x"+r.qtd).filter(x=>x.trim()!=="x").join(", ")}\nAREIA: ${(()=>{const sd=(s,lbl)=>{const g=[];const r=S(val("molde.areiaR"+s));if(r)g.push("60/70 R "+r+" ("+rPct(s)+"%)");if(S(val("molde.face"+s))==="Sim")areiaMix("areiaMix"+s).forEach(e=>{const a=areiaFaceById(e.id);if(a)g.push(a.grade+(e.peso?" "+e.peso+"kg":""));});return g.length?lbl+": "+g.join(", "):"";};return [sd("F","Frente"),sd("T","Traseira")].filter(x=>x).join(" | ");})()}\n`;
@@ -918,7 +953,7 @@ async function generatePDF(){
   showLoader("Gerando PDF...");
   try{
     const keys=await sList(`p:${curIP.n}:`);const photos={};
-    for(const k of keys){const slot=k.split(":")[2];const v=await sGet(k);if(v){const g=await genImg(v);if(g)photos[slot]=g;}}
+    for(const k of keys){const slot=k.split(":")[2];const v=await photoGet(k);if(v){const g=await genImg(v);if(g)photos[slot]=g;}}
     {const alv=val("al.lateral");if(alv==="Sim"||alv==="Não"){const g=await genImg(REF_AREIA[alv==="Sim"?"com":"sem"]);if(g)photos["areia_lateral"]=g;}}
     syncMoldeTotal();
     const {jsPDF}=window.jspdf;const doc=new jsPDF({unit:"mm",format:"a4"});
@@ -1050,9 +1085,10 @@ async function generatePDF(){
 }
 function goHome(){clearTimeout(saveT);if(curIP)saveData();document.getElementById("detailView").style.display="none";document.getElementById("dActions").style.display="none";
   if(fusReturn){const id=fusReturn;fusReturn=null;curIP=null;openPlan().then(()=>{const f=fusoes.find(x=>x.id===id);if(f){curFusao=f;renderPlan();}});return;}
-  document.getElementById("listView").style.display="block";renderCatTabs();renderList();}
+  document.getElementById("listView").style.display="block";renderCatTabs();renderList();
+  const y=listScrollY||0;requestAnimationFrame(()=>requestAnimationFrame(()=>window.scrollTo(0,y)));}
 async function clearPiece(){if(!curIP)return;if(!confirm(`Limpar a IP ${curIP.n}?\n\nOs DADOS (nome, código, descrição, liga, tabelas, observações e revisões) serão apagados para você cadastrar outra peça neste mesmo número.\n\nAs FOTOS e o número serão MANTIDOS.`))return;const it=promoteSeed(curIP.n);it.cod="";it.desc="";it.liga="";it.cli="";curIP=it;if(!podeGravarLista())return;await sSet("cfg:ips",JSON.stringify(customIps));D=newData({n:curIP.n,cod:"",desc:"",liga:"",cli:"",ini:""});await sSet(dkey(curIP.n),JSON.stringify(D));await loadCounts();const dc=document.getElementById("dCod");if(dc)dc.textContent="";renderForm();toast("IP limpa — pronta para outra peça ✓");}
-async function deletePiece(){if(!curIP)return;if(!confirm(`Excluir a peça IP ${curIP.n} e todas as fotos/dados?`))return;const n=curIP.n;for(const k of await sList(`p:${n}:`))await sDel(k);for(const k of await sList(`ed:${n}:`))await sDel(k);await sDel(dkey(n));if(!podeGravarLista())return;customIps=customIps.filter(x=>x.n!==n);await sSet("cfg:ips",JSON.stringify(customIps));if(SEED_IPS.some(s=>s.n===n)&&!delSeeds.includes(n)){delSeeds.push(n);await sSet("cfg:delSeeds",JSON.stringify(delSeeds));}await loadCounts();goHome();toast("Peça excluída");}
+async function deletePiece(){if(!curIP)return;if(!confirm(`Excluir a peça IP ${curIP.n} e todas as fotos/dados?`))return;const n=curIP.n;for(const k of await sList(`p:${n}:`))await photoDel(k);for(const k of await sList(`rp:${n}:`))await photoDel(k);for(const k of await sList(`ed:${n}:`))await sDel(k);await sDel(dkey(n));if(!podeGravarLista())return;customIps=customIps.filter(x=>x.n!==n);await sSet("cfg:ips",JSON.stringify(customIps));if(SEED_IPS.some(s=>s.n===n)&&!delSeeds.includes(n)){delSeeds.push(n);await sSet("cfg:delSeeds",JSON.stringify(delSeeds));}await loadCounts();goHome();toast("Peça excluída");}
 function openNewPiece(){
   const maxN=allIps().reduce((m,x)=>Math.max(m,x.n),0);
   document.getElementById("npN").value=maxN+1;document.getElementById("npData").value=todayISO();
